@@ -8099,4 +8099,1101 @@ function openCSVDownloadModal() {
         <div style="font-family:var(--font-mono);font-size:11px;color:var(--muted);margin-bottom:14px;background:var(--panel3);padding:8px 12px;border-radius:6px;line-height:1.8;">
           📊 CSV mein har row = ek refresh (30s interval)<br>
           🕐 Columns: Time · Spot · PCR · MaxPain · OI · Volume · Greeks (IV, Delta, Gamma, Theta) · RSI · EMA Bias<br>
-          📁 GitHub path: <span style="color:var(--accent);
+          📁 GitHub path: <span style="color:var(--accent);">${sym}/YYYY-MM/${sym}YYYYMMDD.csv</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
+          <div>
+            <div style="font-family:var(--font-mono);font-size:11px;color:var(--muted);margin-bottom:4px;">SYMBOL</div>
+            <select id="csvSymSel" style="width:100%;background:var(--panel3);border:1px solid var(--border2);color:var(--text);padding:7px 10px;border-radius:6px;font-family:var(--font-mono);font-size:11px;outline:none;">
+              ${['NIFTY 50','BANKNIFTY','SENSEX','FINNIFTY','MIDCPNIFTY'].map(s=>`<option value="${s.replace(' 50','').replace(' ','')}" ${sym===s.replace(' 50','').replace(' ','')?'selected':''}>${s}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <div style="font-family:var(--font-mono);font-size:11px;color:var(--muted);margin-bottom:4px;">DATE</div>
+            <input type="date" id="csvDateSel" value="${today}" style="width:100%;background:var(--panel3);border:1px solid var(--border2);color:var(--text);padding:7px 10px;border-radius:6px;font-family:var(--font-mono);font-size:11px;outline:none;">
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button onclick="downloadCSV(document.getElementById('csvSymSel').value, document.getElementById('csvDateSel').value)" 
+            style="flex:1;background:linear-gradient(135deg,#00c9ff,#0055ff);border:none;color:#000;padding:10px 20px;border-radius:6px;cursor:pointer;font-family:var(--font-mono);font-size:11px;font-weight:bold;letter-spacing:1px;">
+            📥 DOWNLOAD CSV
+          </button>
+          <button onclick="document.getElementById('csvModalOverlay').remove()" style="background:var(--panel3);border:1px solid var(--border2);color:var(--muted);padding:10px 16px;border-radius:6px;cursor:pointer;font-family:var(--font-mono);font-size:10px;">CLOSE</button>
+        </div>
+        <div style="margin-top:12px;font-family:var(--font-mono);font-size:11px;color:var(--muted);line-height:1.6;">
+          ⚠ CSV file tabhi banega jab GitHub token set ho aur market hours (9:15-3:30) mein auto-refresh ON ho.<br>
+          💡 CSV ko Excel mein kholo ya AI ko do strategy analysis ke liye.
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+}
+
+
+
+/* ══════════════════════════════════════════════════════════
+   BUYER vs SELLER ADVISOR ENGINE
+   CSV analysis se nikale rules:
+   - IV > 30% = Seller dominant (options mehengi = buyer lose)
+   - Theta > 400 = Extreme time decay = seller ka din
+   - Both sides OI build = writers dono side = seller active
+   - PCR < 0.80 = Call writers active = bearish sellers
+   - DTE = 0 (expiry) = Seller ka din, CE buying BAND
+   
+   Buyer favorable tabhi jab:
+   - IV < 22% (options saste)
+   - Delta 0.45-0.60 for CE / -0.45 to -0.60 for PE
+   - Theta < 300
+   - EMA + PCR dono ek direction mein
+══════════════════════════════════════════════════════════ */
+
+function runBuyerSellerAdvisor() {
+  const wrap = document.getElementById('bsAdvisorWrap');
+  if (!wrap) return;
+  if (!chainData || !chainData.length) { wrap.style.display='none'; return; }
+  wrap.style.display = 'block';
+
+  const instrKey = document.getElementById('symbolSel')?.value || '';
+  const step     = INSTRUMENTS[instrKey]?.step || 50;
+  const spot     = chainData[0]?.underlying_spot_price || 0;
+  const atm      = Math.round(spot / step) * step;
+  const expiry   = document.getElementById('expirySel')?.value || '';
+  const dte      = getDaysToExpiry ? getDaysToExpiry(expiry) : 99;
+
+  // Find ATM row
+  const atmRow = chainData.find(d => d.strike_price === atm) || chainData[Math.floor(chainData.length/2)];
+  const ceMD = atmRow?.call_options?.market_data   || {};
+  const peMD = atmRow?.put_options?.market_data    || {};
+  const ceG  = atmRow?.call_options?.option_greeks || {};
+  const peG  = atmRow?.put_options?.option_greeks  || {};
+
+  const ce_ltp   = ceMD.ltp   || 0;
+  const pe_ltp   = peMD.ltp   || 0;
+  const ce_iv    = (ceG.iv    || 0) * 100;  // convert to %
+  const pe_iv    = (peG.iv    || 0) * 100;
+  const ce_delta = ceG.delta  || 0;
+  const pe_delta = peG.delta  || 0;
+  const ce_theta = Math.abs(ceG.theta || 0);
+  const ce_gamma = ceG.gamma  || 0;
+
+  // PCR
+  let totalCallOI=0, totalPutOI=0, callBuild=0, putBuild=0;
+  chainData.forEach(d => {
+    const c = d.call_options?.market_data || {};
+    const p = d.put_options?.market_data  || {};
+    totalCallOI += c.oi || 0;
+    totalPutOI  += p.oi || 0;
+    const cChg = (c.oi||0)-(c.prev_oi||0);
+    const pChg = (p.oi||0)-(p.prev_oi||0);
+    if(cChg>0) callBuild+=cChg;
+    if(pChg>0) putBuild+=pChg;
+  });
+  const pcr = totalCallOI > 0 ? totalPutOI/totalCallOI : 0;
+
+  // EMA bias from last signal
+  const emaBias = document.getElementById('sentTrendVal')?.textContent || 'NEUTRAL';
+
+  // ═══ SELLER SCORE (0-6) ═══
+  // Thresholds based on 2-day CSV analysis:
+  // Expiry day: IV 33-45%, Theta 400-870
+  // Normal day (DTE 1-3): IV 28-32%, Theta 210-243
+  // Buyer safe only when IV < 18%
+  const thetaLimit = dte === 0 ? 350 : dte === 1 ? 180 : 150;
+  const ivSellerLimit = 25;   // IV > 25% = seller dominant any day
+  const ivBuyerSafe   = 18;   // IV < 18% = safe for buying
+
+  let sellerScore = 0;
+  const sellerFlags = [];
+
+  if (ce_iv > ivSellerLimit) { sellerScore += 2; sellerFlags.push(`❌ IV ${ce_iv.toFixed(0)}% > ${ivSellerLimit}% — SELLER DAY`); }
+  else if (ce_iv > ivBuyerSafe) { sellerScore++; sellerFlags.push(`⚠️ IV ${ce_iv.toFixed(0)}% (${ivBuyerSafe}-${ivSellerLimit}%) — risky zone`); }
+  else { sellerFlags.push(`✅ IV ${ce_iv.toFixed(0)}% < ${ivBuyerSafe}% — buyer safe zone`); }
+
+  if (ce_theta > thetaLimit) { sellerScore++; sellerFlags.push(`❌ Theta ${ce_theta.toFixed(0)} > ${thetaLimit} (DTE=${dte})`); }
+  else { sellerFlags.push(`✅ Theta ${ce_theta.toFixed(0)} < ${thetaLimit} — decay ok`); }
+
+  if (callBuild > 0 && putBuild > 0 && Math.min(callBuild,putBuild)/Math.max(callBuild,putBuild) > 0.4) {
+    sellerScore++; sellerFlags.push(`❌ Dono side OI build (writers active)`);
+  } else {
+    sellerFlags.push(`✅ Ek taraf OI build (directional)`);
+  }
+
+  if (pcr < 0.80) { sellerScore++; sellerFlags.push(`❌ PCR ${pcr.toFixed(3)} < 0.80 (call writers)`); }
+  else if (pcr > 1.1) { sellerFlags.push(`✅ PCR ${pcr.toFixed(3)} > 1.10 (put writers = bullish)`); }
+  else { sellerFlags.push(`⚠️ PCR ${pcr.toFixed(3)} neutral zone`); }
+
+  if (dte === 0) { sellerScore += 2; sellerFlags.push(`❌ EXPIRY DAY (DTE=0) — sellers win`); }
+  else if (dte === 1) { sellerScore++; sellerFlags.push(`⚠️ Kal expiry (DTE=1) — theta high`); }
+  else { sellerFlags.push(`✅ DTE=${dte} — theta normal`); }
+
+  // ═══ BUYER SCORE (0-5) ═══
+  let buyerScore = 0;
+  const buyerFlags = [];
+
+  const ivCheap = ce_iv < ivBuyerSafe;   // < 18% = truly cheap
+  const ivRisky = ce_iv >= ivBuyerSafe && ce_iv < ivSellerLimit; // 18-25% = risky
+  const thetaOk = ce_theta < thetaLimit;
+  const ceDeltaOk = ce_delta >= 0.45 && ce_delta <= 0.62;
+  const peDeltaOk = pe_delta <= -0.45 && pe_delta >= -0.62;
+  const emaBull  = emaBias.includes('BULLISH') || emaBias.includes('Bull');
+  const emaBear  = emaBias.includes('BEARISH') || emaBias.includes('Bear');
+  const pcrBull  = pcr > 0.90;
+  const pcrBear  = pcr < 0.75;
+
+  if (ivCheap) { buyerScore++; buyerFlags.push(`✅ IV ${ce_iv.toFixed(0)}% < 22% (options saste — buyer ka mauka)`); }
+  else { buyerFlags.push(`❌ IV ${ce_iv.toFixed(0)}% bahut zyada — buying avoid karo`); }
+
+  if (thetaOk) { buyerScore++; buyerFlags.push(`✅ Theta ${ce_theta.toFixed(0)} < 350 — decay ok`); }
+  else { buyerFlags.push(`❌ Theta ${ce_theta.toFixed(0)} — premium jaldi ghisega`); }
+
+  if (ceDeltaOk) { buyerFlags.push(`✅ CE Delta ${ce_delta.toFixed(3)} ATM zone (0.45-0.62)`); }
+  else if (ce_delta > 0.62) { buyerFlags.push(`⚠️ CE Delta ${ce_delta.toFixed(3)} — already ITM, expensive`); }
+  else { buyerFlags.push(`❌ CE Delta ${ce_delta.toFixed(3)} — too OTM, risky`); }
+
+  if (peDeltaOk) { buyerFlags.push(`✅ PE Delta ${pe_delta.toFixed(3)} ATM zone`); }
+  else { buyerFlags.push(`⚠️ PE Delta ${pe_delta.toFixed(3)} — check karo`); }
+
+  if (emaBull && pcrBull) { buyerScore++; buyerFlags.push(`✅ EMA Bullish + PCR ${pcr.toFixed(2)} > 0.90 = CE buy confirm`); }
+  else if (emaBear && pcrBear) { buyerScore++; buyerFlags.push(`✅ EMA Bearish + PCR ${pcr.toFixed(2)} < 0.75 = PE buy confirm`); }
+  else { buyerFlags.push(`⚠️ EMA aur PCR match nahi — wait karo`); }
+
+  // ═══ CE / PE VERDICT ═══
+  let ceVerdict='', ceColor='', ceReason='';
+  let peVerdict='', peColor='', peReason='';
+
+  const sellerWin = sellerScore >= 3;
+
+  if (sellerWin && dte === 0) {
+    ceVerdict = '🚫 MAT KAR'; ceColor = '#ff3d6b';
+    ceReason  = 'Expiry day — Theta bahut zyada, CE definitely 0 hoga';
+    peVerdict = '🚫 MAT KAR'; peColor = '#ff3d6b';
+    peReason  = 'Expiry day — Seller dominant, buying BAND';
+  } else if (sellerWin) {
+    ceVerdict = '⚠️ AVOID';   ceColor = '#ff9f40';
+    ceReason  = `IV ${ce_iv.toFixed(0)}% zyada + Theta high — seller ka din`;
+    peVerdict = '⚠️ AVOID';   peColor = '#ff9f40';
+    peReason  = 'Sellers dono side active — buyer ko nuksan';
+  } else {
+    // Buyer possible — check direction
+    if (ivCheap && thetaOk && emaBull && pcrBull && ceDeltaOk) {
+      ceVerdict = '✅ CE BUY';  ceColor = '#00e5a0';
+      ceReason  = `IV=${ce_iv.toFixed(0)}% sasta + EMA Bull + PCR ${pcr.toFixed(2)} — ENTRY VALID`;
+      buyerScore++;
+    } else if (ivCheap && thetaOk && ceDeltaOk) {
+      ceVerdict = '🟡 POSSIBLE'; ceColor = '#ffd000';
+      ceReason  = `IV sasta, Delta ok — EMA ya PCR confirm karo`;
+    } else {
+      ceVerdict = '❌ WAIT';    ceColor = '#888';
+      ceReason  = 'Conditions match nahi — entry nahi lena';
+    }
+
+    if (ivCheap && thetaOk && emaBear && pcrBear && peDeltaOk) {
+      peVerdict = '✅ PE BUY';  peColor = '#00e5a0';
+      peReason  = `IV=${pe_iv.toFixed(0)}% sasta + EMA Bear + PCR ${pcr.toFixed(2)} — ENTRY VALID`;
+      buyerScore++;
+    } else if (ivCheap && thetaOk && peDeltaOk) {
+      peVerdict = '🟡 POSSIBLE'; peColor = '#ffd000';
+      peReason  = `IV sasta, Delta ok — EMA ya PCR confirm karo`;
+    } else {
+      peVerdict = '❌ WAIT';    peColor = '#888';
+      peReason  = 'Conditions match nahi — wait karo';
+    }
+  }
+
+  // ═══ Market type ═══
+  let marketType='', marketColor='', marketReason='', badgeText='';
+  if (sellerScore >= 4) {
+    marketType='SELLER KA DIN'; marketColor='#ff3d6b';
+    marketReason=`Seller score ${sellerScore}/6 — buying karna nuksandeh hai`;
+    badgeText='SELLER DOMINANT';
+  } else if (sellerScore >= 2 && buyerScore >= 3) {
+    marketType='MIXED MARKET'; marketColor='#ffd000';
+    marketReason=`Seller ${sellerScore}/6, Buyer ${buyerScore}/5 — caution se`;
+    badgeText='MIXED';
+  } else if (buyerScore >= 3) {
+    marketType='BUYER KA DIN'; marketColor='#00e5a0';
+    marketReason=`Buyer score ${buyerScore}/5 — conditions favorable hain`;
+    badgeText='BUYER FAVORABLE';
+  } else {
+    marketType='WAIT KARO'; marketColor='#ffd000';
+    marketReason='Clear signal nahi — data aane do';
+    badgeText='NEUTRAL';
+  }
+
+  // ═══ Final Advice ═══
+  let finalAdvice = '';
+  if (dte === 0) {
+    finalAdvice = `🔴 <b>EXPIRY DAY — CE/PE buying BILKUL MAT KARO</b><br>Theta ${ce_theta.toFixed(0)}/day hai. Premium minute minute mein ghis raha hai. Aaj sirf sellers kamate hain. Agar position hai toh 2 PM se pehle exit karo.`;
+  } else if (ce_iv > ivSellerLimit) {
+    finalAdvice = `🔴 <b>SELLER DAY — IV ${ce_iv.toFixed(0)}% > ${ivSellerLimit}%</b><br>Options bahut mehengi hain. Direction sahi ho tab bhi premium wapas nahi milega (aaj SENSEX 489 pts gira, phir bhi PE -4% hua). <b>IV < 18% hone ka wait karo.</b>`;
+  } else if (ce_iv > ivBuyerSafe) {
+    finalAdvice = `⚠️ <b>RISKY ZONE — IV ${ce_iv.toFixed(0)}% (${ivBuyerSafe}-${ivSellerLimit}%)</b><br>Buying possible hai par risky. Agar strong signal ho tabhi enter karo, warna wait karo IV < ${ivBuyerSafe}% ho.`;
+  } else if (ceVerdict.includes('CE BUY')) {
+    finalAdvice = `🟢 <b>CE BUY opportunity:</b> ATM ${atm} CE @ ₹${ce_ltp.toFixed(2)}<br>IV sasta (${ce_iv.toFixed(0)}%), Delta ATM zone (${ce_delta.toFixed(3)}), EMA + PCR bullish confirm kar rahe hain.<br>Stop loss: 40% premium loss pe exit karo.`;
+  } else if (peVerdict.includes('PE BUY')) {
+    finalAdvice = `🟢 <b>PE BUY opportunity:</b> ATM ${atm} PE @ ₹${pe_ltp.toFixed(2)}<br>IV sasta (${pe_iv.toFixed(0)}%), Delta ATM zone (${pe_delta.toFixed(3)}), EMA + PCR bearish confirm kar rahe hain.<br>Stop loss: 40% premium loss pe exit karo.`;
+  } else {
+    finalAdvice = `🟡 <b>Abhi wait karo.</b> Seller score ${sellerScore}/6 — IV ${ce_iv.toFixed(0)}%, Theta ${ce_theta.toFixed(0)}.<br>Buyer tab aana jab IV < 22% ho, EMA + PCR ek direction mein hon, aur Theta < 350 ho.`;
+  }
+
+  // ═══ Render ═══
+  const el = id => document.getElementById(id);
+
+  el('bsMarketBadge').textContent = badgeText;
+  el('bsMarketBadge').style.color = marketColor;
+  el('bsMarketBadge').style.borderColor = marketColor + '44';
+  el('bsMarketBadge').style.background  = marketColor + '15';
+
+  el('bsMarketType').textContent   = marketType;
+  el('bsMarketType').style.color   = marketColor;
+  el('bsMarketReason').textContent = marketReason;
+
+  el('bsCEVerdict').textContent  = ceVerdict;
+  el('bsCEVerdict').style.color  = ceColor;
+  el('bsCEReason').textContent   = ceReason;
+
+  el('bsPEVerdict').textContent  = peVerdict;
+  el('bsPEVerdict').style.color  = peColor;
+  el('bsPEReason').textContent   = peReason;
+
+  el('bsSellerScore').textContent = `${sellerScore}/6`;
+  el('bsSellerBar').style.width   = `${Math.min(100, sellerScore/6*100)}%`;
+  el('bsBuyerScore').textContent  = `${buyerScore}/5`;
+  el('bsBuyerBar').style.width    = `${Math.min(100, buyerScore/5*100)}%`;
+
+  // Checklist — combine both flags
+  const allFlags = [...sellerFlags, ...buyerFlags];
+  el('bsChecklist').innerHTML = allFlags.map(f =>
+    `<div style="padding:3px 0;color:${f.startsWith('✅')?'#00c896':f.startsWith('❌')?'#ff6b6b':'#ffd000'}">${f}</div>`
+  ).join('');
+
+  el('bsFinalAdvice').innerHTML = finalAdvice;
+}
+
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelector(`.tab:nth-child(${name==='oauth'?1:2})`).classList.add('active');
+  document.getElementById(name==='oauth' ? 'tabOauth' : 'tabToken').classList.add('active');
+}
+
+function startOAuth() {
+  const key      = document.getElementById('apiKey').value.trim();
+  const redirect = document.getElementById('redirectUri').value.trim();
+  if (!key || !redirect) return toast('Enter API Key and Redirect URI', true);
+  const url = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${encodeURIComponent(key)}&redirect_uri=${encodeURIComponent(redirect)}`;
+  localStorage.setItem('upstox_api_key', key);
+  localStorage.setItem('upstox_api_secret', document.getElementById('apiSecret').value.trim());
+  localStorage.setItem('upstox_redirect', redirect);
+  window.open(url, '_blank');
+  document.getElementById('codeCard').style.display = 'block';
+  document.getElementById('authCodeApiKey').value   = key;
+  document.getElementById('authCodeSecret').value   = document.getElementById('apiSecret').value.trim();
+  document.getElementById('authCodeRedirect').value = redirect;
+}
+
+async function exchangeCode() {
+  const code   = document.getElementById('authCode').value.trim();
+  const key    = document.getElementById('authCodeApiKey').value.trim();
+  const secret = document.getElementById('authCodeSecret').value.trim();
+  const redir  = document.getElementById('authCodeRedirect').value.trim();
+  if (!code || !key || !secret || !redir) return toast('Fill all fields', true);
+  const body = new URLSearchParams({ code, client_id:key, client_secret:secret, redirect_uri:redir, grant_type:'authorization_code' });
+  try {
+    const res = await fetch(`https://corsproxy.io/?${encodeURIComponent('https://api.upstox.com/v2/login/authorization/token')}`, {
+      method:'POST', headers:{ 'Content-Type':'application/x-www-form-urlencoded', Accept:'application/json' }, body: body.toString()
+    });
+    const data = await res.json();
+    if (data.access_token) initWithToken(data.access_token);
+    else toast('Token exchange failed: ' + (data.message || JSON.stringify(data)), true);
+  } catch(e) { toast('Network error: ' + e.message + '. Try Direct Token tab.', true); }
+}
+
+function loginWithToken() {
+  const t = document.getElementById('directToken').value.trim();
+  if (!t) return toast('Paste your access token', true);
+  initWithToken(t);
+}
+
+function initWithToken(token) {
+  accessToken = token;
+  localStorage.setItem('upstox_token', token);
+  document.getElementById('authScreen').style.display = 'none';
+  document.getElementById('mainApp').style.display    = 'block';
+  document.getElementById('logoutBtn').style.display  = 'flex';
+  onSymbolChange();
+  setTimeout(loadNews, 500);
+}
+
+function logout() {
+  accessToken = '';
+  localStorage.removeItem('upstox_token');
+  chainData = [];
+  document.getElementById('mainApp').style.display    = 'none';
+  document.getElementById('authScreen').style.display = 'flex';
+  document.getElementById('logoutBtn').style.display  = 'none';
+  if (autoTimer) clearInterval(autoTimer);
+}
+
+if (accessToken) setTimeout(() => initWithToken(accessToken), 100);
+
+(function() {
+  const params = new URLSearchParams(location.search);
+  if (params.get('code')) {
+    document.getElementById('codeCard').style.display   = 'block';
+    document.getElementById('authCode').value           = params.get('code');
+    document.getElementById('authCodeApiKey').value     = localStorage.getItem('upstox_api_key') || '';
+    document.getElementById('authCodeSecret').value     = localStorage.getItem('upstox_api_secret') || '';
+    document.getElementById('authCodeRedirect').value   = localStorage.getItem('upstox_redirect') || '';
+    history.replaceState({}, '', location.pathname);
+  }
+})();
+
+/* ═════════════════════════════ FETCH EXPIRIES ══ */
+async function onSymbolChange() {
+  const key = document.getElementById('symbolSel').value;
+  const autoLot = key.includes('Nifty Bank') || key.includes('BANKEX') ? 30
+                : key.includes('SENSEX')     ? 20
+                : key.includes('Nifty')      ? 65
+                : 65;
+  const ls=document.getElementById('btLotSize'); if(ls) ls.value=autoLot;
+  const sel = document.getElementById('expirySel');
+  sel.innerHTML = '<option>Loading...</option>';
+  try {
+    const r = await upstoxGet(`https://api.upstox.com/v2/option/contract?instrument_key=${encodeURIComponent(key)}`);
+    if (!r.data?.length) throw new Error('No contracts found');
+    const expiries = [...new Set(r.data.map(d => d.expiry))].sort();
+    sel.innerHTML = expiries.map(e => `<option value="${e}">${e}</option>`).join('');
+    fetchChain();
+  } catch(e) {
+    toast('Failed to load expiries: ' + e.message, true);
+    fetchChain();
+  }
+}
+
+/* ══════════════════════════ FETCH CHAIN ══ */
+async function fetchChain() {
+  // Reset EMA chart key if symbol changed
+  const _curSym = document.getElementById('symbolSel')?.value || '';
+  if (window._emaLastSymbol !== _curSym) {
+    window._emaChartKey = null;
+    window._emaLastSymbol = _curSym;
+  }
+  const instrKey = document.getElementById('symbolSel').value;
+  const expiry   = document.getElementById('expirySel').value;
+  if (!expiry || expiry === 'Loading...') return;
+  document.getElementById('tableContainer').innerHTML = '<div class="center-msg"><div class="spinner"></div><div>FETCHING LIVE OPTION CHAIN...</div></div>';
+  try {
+    const url = `https://api.upstox.com/v2/option/chain?instrument_key=${encodeURIComponent(instrKey)}&expiry_date=${expiry}`;
+    const r = await upstoxGet(url);
+    if (r.status !== 'success' || !r.data) throw new Error(r.message || 'Bad response');
+    chainData = r.data;
+    renderTable();
+    updateStats();
+    const _cd = buildChartData(); if(_cd) renderChart(_cd, activeChartType);
+    onChainLoaded();
+    toast('✓ Option chain loaded — ' + chainData.length + ' strikes', false);
+  } catch(e) {
+    const instrKey = document.getElementById('symbolSel').value;
+    const isStock  = INSTRUMENTS[instrKey]?.type === 'stock';
+    const errMsg   = isStock
+      ? `⚠ Stock option chain load nahi hua: ${e.message}<br><br>
+         <span style="font-size:10px;color:var(--muted)">
+         Stock ke liye Upstox instrument key exact hona chahiye (e.g. NSE_EQ|INE040A01034).<br>
+         Upstox Developer Console → Instruments list se exact key copy karo.<br>
+         Ya phir Index (Nifty/Sensex) try karo.
+         </span>`
+      : `⚠ ${e.message}`;
+    document.getElementById('tableContainer').innerHTML = `<div class="center-msg" style="color:var(--red);text-align:center;padding:30px;">${errMsg}</div>`;
+    toast(e.message, true);
+  }
+}
+
+/* ══════════════════════════ API HELPER ══ */
+async function upstoxGet(url) {
+  const proxies = [
+    async () => {
+      const r = await fetch(url, { headers:{ Authorization:`Bearer ${accessToken}`, Accept:'application/json' } });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    },
+    async () => {
+      const r = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, { headers:{ Authorization:`Bearer ${accessToken}`, Accept:'application/json' } });
+      if (!r.ok) throw new Error(`Proxy HTTP ${r.status}`);
+      return r.json();
+    },
+    async () => {
+      const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`);
+      const w = await r.json();
+      return JSON.parse(w.contents);
+    }
+  ];
+  for (let i = 0; i < proxies.length; i++) {
+    try {
+      return await Promise.race([proxies[i](), new Promise((_,rej) => setTimeout(()=>rej(new Error('Timeout')),10000))]);
+    } catch(e) { if (i === proxies.length - 1) throw e; }
+  }
+}
+
+/* ══════════════════════════ STATS ══ */
+function updateStats() {
+  if (!chainData.length) return;
+  const spot = chainData[0].underlying_spot_price || 0;
+  document.getElementById('statSpot').textContent    = fmt(spot);
+  // Show selected symbol label — NOT underlying_key from API (which may differ for stocks)
+  const _instrKey = document.getElementById('symbolSel').value;
+  const _instrLabel = INSTRUMENTS[_instrKey]?.label || (chainData[0].underlying_key?.split('|')[1] || '');
+  document.getElementById('statSpotSub').textContent = _instrLabel;
+
+  let callOI = 0, putOI = 0;
+  chainData.forEach(d => {
+    callOI += d.call_options?.market_data?.oi || 0;
+    putOI  += d.put_options?.market_data?.oi  || 0;
+  });
+  const pcr = callOI > 0 ? putOI / callOI : 0;
+  document.getElementById('statCallOI').textContent  = fmtK(callOI);
+  document.getElementById('statPutOI').textContent   = fmtK(putOI);
+  document.getElementById('statPCR').textContent     = pcr.toFixed(2);
+  document.getElementById('statPCRsig').textContent  = pcr > 1.3 ? '🟢 Bullish Bias' : pcr < 0.7 ? '🔴 Bearish Bias' : '🟡 Neutral';
+
+  const maxPain = calcMaxPain(chainData, spot);
+  const diff    = maxPain - spot;
+  document.getElementById('statPain').textContent     = fmt(maxPain);
+  document.getElementById('statPainDiff').textContent = (diff >= 0 ? '+' : '') + Math.round(diff) + ' from spot';
+
+  const instrKey = document.getElementById('symbolSel').value;
+  const step     = INSTRUMENTS[instrKey]?.step || 50;
+  const atm      = Math.round(spot / step) * step;
+  const atmRow   = chainData.find(d => d.strike_price === atm);
+  if (atmRow) {
+    const skew = (atmRow.put_options?.option_greeks?.iv || 0) - (atmRow.call_options?.option_greeks?.iv || 0);
+    document.getElementById('statIVskew').textContent = (skew >= 0 ? '+' : '') + skew.toFixed(2) + '%';
+  }
+  const label = INSTRUMENTS[instrKey]?.label || instrKey;
+  document.getElementById('tableSubtitle').textContent = `${label} — ${document.getElementById('expirySel').value}`;
+}
+
+function calcMaxPain(rows, spot) {
+  // Max Pain = strike where total option buyer loss is MAXIMUM (writer profit max)
+  // Call buyer loses when expiry < strike → loss per contract = max(0, strike - expiry_price)
+  // Put buyer loses when expiry > strike  → loss per contract = max(0, expiry_price - strike)
+  let best = rows[0]?.strike_price || spot, min = Infinity;
+  rows.forEach(target => {
+    const t = target.strike_price; // candidate expiry price
+    let pain = 0;
+    rows.forEach(r => {
+      const s = r.strike_price;
+      // Call holders lose: strike > expiry → (strike - expiry) * call_OI
+      pain += Math.max(0, s - t) * (r.call_options?.market_data?.oi || 0);
+      // Put holders lose:  expiry > strike → (expiry - strike) * put_OI
+      pain += Math.max(0, t - s) * (r.put_options?.market_data?.oi  || 0);
+    });
+    if (pain < min) { min = pain; best = t; }
+  });
+  return best;
+}
+
+/* ══════════════════════════ FILTERS ══ */
+function rowPasses(d) {
+  const ce = d.call_options?.market_data  || {};
+  const pe = d.put_options?.market_data   || {};
+  const cg = d.call_options?.option_greeks|| {};
+  const pg = d.put_options?.option_greeks || {};
+  const oiPct = parseFloat(document.getElementById('fOIpct').value) || 0;
+  const volMin = parseFloat(document.getElementById('fVol').value)  || 0;
+  const ivMin  = parseFloat(document.getElementById('fIVmin').value) || 0;
+  const ivMax  = parseFloat(document.getElementById('fIVmax').value) || 9999;
+  if (oiPct > 0) {
+    const cChg = ce.oi > 0 ? Math.abs((ce.oi - ce.prev_oi) / ce.prev_oi * 100) : 0;
+    const pChg = pe.oi > 0 ? Math.abs((pe.oi - pe.prev_oi) / pe.prev_oi * 100) : 0;
+    if (cChg < oiPct && pChg < oiPct) return false;
+  }
+  if (volMin > 0 && (ce.volume||0) < volMin && (pe.volume||0) < volMin) return false;
+  if (ivMin > 0 || ivMax < 9999) {
+    const civ = cg.iv||0, piv = pg.iv||0;
+    if ((civ < ivMin || civ > ivMax) && (piv < ivMin || piv > ivMax)) return false;
+  }
+  if (activePills.has('pSpike')) {
+    const avg = ((ce.oi||0) + (pe.oi||0)) * 0.008;
+    if ((ce.volume||0) < avg && (pe.volume||0) < avg) return false;
+  }
+  if (activePills.has('pBuild')  && (ce.oi - ce.prev_oi <= 0) && (pe.oi - pe.prev_oi <= 0)) return false;
+  if (activePills.has('pUnwind') && (ce.oi - ce.prev_oi >= 0) && (pe.oi - pe.prev_oi >= 0)) return false;
+  if (activePills.has('pHighIV') && (cg.iv||0) < 20 && (pg.iv||0) < 20) return false;
+  if (activePills.has('pLongCE') && !((ce.oi - ce.prev_oi > 0) && ((ce.ltp||0) > (ce.close_price||0)))) return false;
+  if (activePills.has('pShortPE')&& !((pe.oi - pe.prev_oi > 0) && ((pe.ltp||0) < (pe.close_price||0)))) return false;
+  return true;
+}
+
+/* ══════════════════════════ TABLE ══ */
+function renderTable() {
+  if (!chainData.length) return;
+  const instrKey   = document.getElementById('symbolSel').value;
+  const step       = INSTRUMENTS[instrKey]?.step || 50;
+  const spot       = chainData[0].underlying_spot_price || 0;
+  const atm        = Math.round(spot / step) * step;
+  const range      = parseInt(document.getElementById('strikeRange').value);
+  const showGreeks = document.getElementById('showGreeks').value === '1';
+
+  let rows = [...chainData].sort((a,b) => a.strike_price - b.strike_price);
+  if (range < 999) rows = rows.filter(d => Math.abs(d.strike_price - atm) <= range * step);
+  maxOI = Math.max(...rows.map(d => Math.max(d.call_options?.market_data?.oi||0, d.put_options?.market_data?.oi||0)), 1);
+
+  // ── Strike summary: 1-line explanation of what's happening ──
+  function getStrikeSummary(d, atm, step, spot) {
+    const ce = d.call_options?.market_data   || {};
+    const pe = d.put_options?.market_data    || {};
+    const ceOIchg = ce.prev_oi > 0 ? (ce.oi - ce.prev_oi) / ce.prev_oi * 100 : 0;
+    const peOIchg = pe.prev_oi > 0 ? (pe.oi - pe.prev_oi) / pe.prev_oi * 100 : 0;
+    const ceVolR  = ce.oi > 0 ? ce.volume / ce.oi * 100 : 0;
+    const peVolR  = pe.oi > 0 ? pe.volume / pe.oi * 100 : 0;
+    const s = d.strike_price;
+    const aboveSpot = s > spot;
+    const belowSpot = s < spot;
+    const bothHeavy = ce.oi > 0 && pe.oi > 0 && Math.abs(ce.oi - pe.oi) / Math.max(ce.oi, pe.oi) < 0.2;
+
+    // Returns: { emoji, label, detail, tag, tagColor, rowColor, rowBorder }
+    if (ceOIchg > 200 && aboveSpot)  return { emoji:'🔴', label:'CALL WALL', detail:'Heavy call writing — ceiling strong', tag:'RESIST', tagColor:'#ff1a4a', rowColor:'rgba(255,30,60,.07)', rowBorder:'#ff1a4a' };
+    if (peOIchg > 200 && belowSpot)  return { emoji:'🟢', label:'PUT WALL', detail:'Heavy put writing — floor strong', tag:'SUPPORT', tagColor:'#00e5a0', rowColor:'rgba(0,229,160,.07)', rowBorder:'#00e5a0' };
+    if (ceOIchg > 50  && aboveSpot)  return { emoji:'🔴', label:'CALL BUILD', detail:'Call writers adding — resistance bana raha hai', tag:'RESIST', tagColor:'#ff3d6b', rowColor:'rgba(255,30,60,.05)', rowBorder:'#ff3d6b' };
+    if (peOIchg > 50  && belowSpot)  return { emoji:'🟢', label:'PUT BUILD', detail:'Put writers adding — support bana raha hai', tag:'SUPPORT', tagColor:'#00c896', rowColor:'rgba(0,229,160,.05)', rowBorder:'#00c896' };
+    if (ceOIchg < -30 && aboveSpot)  return { emoji:'🟡', label:'CALL UNWIND', detail:'Call writers nikal rahe — ceiling toot sakti', tag:'WEAK ↓', tagColor:'#ffd000', rowColor:'rgba(255,208,0,.05)', rowBorder:'#ffd000' };
+    if (peOIchg < -30 && belowSpot)  return { emoji:'🟡', label:'PUT UNWIND', detail:'Put writers nikal rahe — support kamzor', tag:'WEAK ↑', tagColor:'#ffd000', rowColor:'rgba(255,208,0,.05)', rowBorder:'#ffd000' };
+    if (ceVolR > 500  && aboveSpot)  return { emoji:'🔥', label:'CE VOL SPIKE', detail:'Call mein massive volume — koi bada bet', tag:'WATCH', tagColor:'#ff6b00', rowColor:'rgba(255,107,0,.06)', rowBorder:'#ff6b00' };
+    if (peVolR > 500  && belowSpot)  return { emoji:'🔥', label:'PE VOL SPIKE', detail:'Put mein massive volume — koi bada bet', tag:'WATCH', tagColor:'#ff6b00', rowColor:'rgba(255,107,0,.06)', rowBorder:'#ff6b00' };
+    if (s === atm && bothHeavy)      return { emoji:'⚖️', label:'ATM BATTLE', detail:'Dono side barabar — range-bound sideways', tag:'ATM', tagColor:'#00c9ff', rowColor:'rgba(0,201,255,.06)', rowBorder:'#00c9ff' };
+    if (s === atm)                   return { emoji:'📍', label:'ATM ZONE', detail:'Current price yahan — max action here', tag:'ATM', tagColor:'#00c9ff', rowColor:'rgba(0,201,255,.06)', rowBorder:'#00c9ff' };
+    if (ce.oi > pe.oi * 2 && aboveSpot) return { emoji:'🔴', label:'CE HEAVY', detail:'Call OI dominant — resistance zone', tag:'RESIST', tagColor:'#ff3d6b', rowColor:'rgba(255,30,60,.03)', rowBorder:'#ff3d6b' };
+    if (pe.oi > ce.oi * 2 && belowSpot) return { emoji:'🟢', label:'PE HEAVY', detail:'Put OI dominant — support zone', tag:'SUPPORT', tagColor:'#00c896', rowColor:'rgba(0,229,160,.03)', rowBorder:'#00c896' };
+    return null;
+  }
+
+  let visible = 0;
+  const tbody = rows.map(d => {
+    const ce = d.call_options?.market_data  || {};
+    const pe = d.put_options?.market_data   || {};
+    const cg = d.call_options?.option_greeks|| {};
+    const pg = d.put_options?.option_greeks || {};
+    const isATM  = d.strike_price === atm;
+    const passes = rowPasses(d);
+    if (passes) visible++;
+    const ceOIchg = (ce.prev_oi > 0) ? ((ce.oi - ce.prev_oi) / ce.prev_oi * 100) : 0;
+    const peOIchg = (pe.prev_oi > 0) ? ((pe.oi - pe.prev_oi) / pe.prev_oi * 100) : 0;
+    const ceVBar  = Math.round((ce.oi / maxOI) * 70);
+    const peVBar  = Math.round((pe.oi / maxOI) * 70);
+    const ceVolRatio = ce.oi > 0 ? (ce.volume / ce.oi * 100) : 0;
+    const peVolRatio = pe.oi > 0 ? (pe.volume / pe.oi * 100) : 0;
+    function oiBadge(chg) {
+      if (Math.abs(chg) < 5) return '';
+      return chg > 0 ? `<span class="badge badge-up">+${chg.toFixed(0)}%</span>`
+                     : `<span class="badge badge-dn">${chg.toFixed(0)}%</span>`;
+    }
+    function volBadge(r) { return r > 12 ? `<span class="badge badge-spk">SPIKE</span>` : ''; }
+    function ivBadge(iv) { return iv > 25 ? `<span class="badge badge-high">${iv.toFixed(1)}%</span>` : `${(iv||0).toFixed(1)}%`; }
+
+    const summary  = getStrikeSummary(d, atm, step, spot);
+    const rowBg    = summary ? `background:${summary.rowColor};` : '';
+    const leftBorder = summary ? `border-left:3px solid ${summary.rowBorder};` : '';
+
+    // ACTION cell — center column replacement
+    const actionCell = (() => {
+      if (!summary) return `<td class="strike-cell" style="min-width:130px;">
+        <div style="font-family:var(--font-disp);font-size:13px;letter-spacing:1px;">${fmtN(d.strike_price)}</div>
+        <div style="display:flex;gap:4px;margin-top:2px;justify-content:center;">${isATM ? '<span class="atm-badge">ATM</span>':''} ${getStrikeRec(d, atm, step)}</div>
+      </td>`;
+      return `<td class="strike-cell" style="min-width:160px;padding:6px 8px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
+          <span style="font-family:var(--font-disp);font-size:13px;letter-spacing:1px;">${fmtN(d.strike_price)}</span>
+          <div style="display:flex;gap:3px;align-items:center;">
+            ${isATM ? '<span class="atm-badge">ATM</span>':''}
+            ${getStrikeRec(d, atm, step)}
+            <span style="font-size:10px;font-family:var(--font-mono);font-weight:700;padding:2px 6px;border-radius:3px;letter-spacing:.5px;background:${summary.tagColor}22;color:${summary.tagColor};border:1px solid ${summary.tagColor}44;">${summary.tag}</span>
+          </div>
+        </div>
+        <div style="margin-top:4px;padding:4px 6px;border-radius:4px;background:rgba(0,0,0,.2);display:flex;align-items:center;gap:5px;">
+          <span style="font-size:13px;line-height:1;">${summary.emoji}</span>
+          <div>
+            <div style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:${summary.tagColor};letter-spacing:.5px;">${summary.label}</div>
+            <div style="font-size:11px;color:var(--muted);margin-top:1px;font-family:var(--font-sans);">${summary.detail}</div>
+          </div>
+        </div>
+      </td>`;
+    })();
+
+    const mainRow = `<tr class="${isATM ? 'atm-row' : ''} ${passes ? '' : 'dim'}" style="${rowBg}${leftBorder}">
+      <td class="call-cell">${ivBadge(cg.iv)}</td>
+      <td class="call-cell">${(cg.delta||0).toFixed(3)}</td>
+      <td class="call-cell">${fmtN(ce.volume)} ${volBadge(ceVolRatio)}</td>
+      <td class="call-cell"><div class="oi-cell">${oiBadge(ceOIchg)}<div class="oi-bar c" style="width:${ceVBar}px"></div>${fmtK(ce.oi)}</div></td>
+      <td class="call-cell">${fmtN(ce.ltp)}</td>
+      ${actionCell}
+      <td class="put-cell">${fmtN(pe.ltp)}</td>
+      <td class="put-cell"><div class="oi-cell">${fmtK(pe.oi)}<div class="oi-bar p" style="width:${peVBar}px"></div>${oiBadge(peOIchg)}</div></td>
+      <td class="put-cell">${fmtN(pe.volume)} ${volBadge(peVolRatio)}</td>
+      <td class="put-cell">${(pg.delta||0).toFixed(3)}</td>
+      <td class="put-cell">${ivBadge(pg.iv)}</td>
+    </tr>`;
+    let greekRow = '';
+    if (showGreeks) {
+      greekRow = `<tr class="greeks-row ${passes ? '' : 'dim'}">
+        <td class="call-cell" colspan="2" style="color:var(--muted)">θ ${(cg.theta||0).toFixed(2)} &nbsp; γ ${(cg.gamma||0).toFixed(4)} &nbsp; ν ${(cg.vega||0).toFixed(2)} &nbsp; PoP ${(cg.pop||0).toFixed(1)}%</td>
+        <td colspan="2"></td>
+        <td class="call-cell">Bid ${fmtN(ce.bid_price)} × ${fmtN(ce.bid_qty)}</td>
+        <td class="strike-cell" style="font-size:10px;color:var(--muted)">PCR ${(d.pcr||0).toFixed(2)}</td>
+        <td class="put-cell">Ask ${fmtN(pe.ask_price)} × ${fmtN(pe.ask_qty)}</td>
+        <td colspan="2"></td>
+        <td class="put-cell" colspan="2" style="color:var(--muted);text-align:left">θ ${(pg.theta||0).toFixed(2)} &nbsp; γ ${(pg.gamma||0).toFixed(4)} &nbsp; ν ${(pg.vega||0).toFixed(2)} &nbsp; PoP ${(pg.pop||0).toFixed(1)}%</td>
+      </tr>`;
+    }
+    return mainRow + greekRow;
+  }).join('');
+
+  document.getElementById('showCount').textContent = `${visible} / ${rows.length} strikes shown`;
+  document.getElementById('tableContainer').innerHTML = `
+    <div style="display:flex;gap:12px;flex-wrap:wrap;padding:8px 12px 10px;border-bottom:1px solid var(--border);margin-bottom:4px;font-family:var(--font-mono);font-size:11px;letter-spacing:.5px;color:var(--muted);">
+      <span style="opacity:.6;letter-spacing:1.5px;">LEGEND:</span>
+      <span><span style="display:inline-block;width:8px;height:8px;background:rgba(255,30,60,.35);border-radius:2px;margin-right:4px;vertical-align:middle;"></span>Call Writing / Resistance</span>
+      <span><span style="display:inline-block;width:8px;height:8px;background:rgba(0,229,160,.35);border-radius:2px;margin-right:4px;vertical-align:middle;"></span>Put Writing / Support</span>
+      <span><span style="display:inline-block;width:8px;height:8px;background:rgba(255,208,0,.35);border-radius:2px;margin-right:4px;vertical-align:middle;"></span>Unwinding / Weak</span>
+      <span><span style="display:inline-block;width:8px;height:8px;background:rgba(255,107,0,.35);border-radius:2px;margin-right:4px;vertical-align:middle;"></span>Volume Spike</span>
+      <span><span style="display:inline-block;width:8px;height:8px;background:rgba(0,201,255,.35);border-radius:2px;margin-right:4px;vertical-align:middle;"></span>ATM</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th class="call-hd" colspan="5" style="text-align:center;border-right:1px solid var(--border)">━━━━ CALLS ━━━━</th>
+          <th class="strike-hd">STRIKE</th>
+          <th class="put-hd" colspan="5" style="text-align:center;border-left:1px solid var(--border)">━━━━ PUTS ━━━━</th>
+        </tr>
+        <tr>
+          <th class="call-hd">IV %</th><th class="call-hd">DELTA</th><th class="call-hd">VOLUME</th>
+          <th class="call-hd" style="border-right:1px solid var(--border)">OI</th>
+          <th class="call-hd" style="border-right:1px solid var(--border)">LTP</th>
+          <th class="strike-hd">PRICE</th>
+          <th class="put-hd" style="border-left:1px solid var(--border)">LTP</th>
+          <th class="put-hd" style="border-left:1px solid var(--border)">OI</th>
+          <th class="put-hd">VOLUME</th><th class="put-hd">DELTA</th><th class="put-hd">IV %</th>
+        </tr>
+      </thead>
+      <tbody>${tbody}</tbody>
+    </table>`;
+  updateFilterBadge();
+}
+
+/* ══════════════════════════ FILTER EVENTS ══ */
+function onFilterChange() {
+  document.getElementById('fOIpctV').textContent = document.getElementById('fOIpct').value + '%';
+  document.getElementById('fVolV').textContent   = fmtK(parseInt(document.getElementById('fVol').value));
+  renderTable();
+}
+function togglePill(btn) {
+  const id = btn.id, col = btn.dataset.color;
+  if (activePills.has(id)) { activePills.delete(id); btn.className = 'pill'; }
+  else { activePills.add(id); btn.className = `pill active ${col}`; }
+  renderTable();
+}
+function toggleFilters(hdr) {
+  const body = document.getElementById('filterBody');
+  const chev = hdr.querySelector('.filter-chevron');
+  const open = body.classList.toggle('open');
+  hdr.classList.toggle('open', open);
+  chev.classList.toggle('open', open);
+}
+function updateFilterBadge() {
+  const active = activePills.size
+    + (parseFloat(document.getElementById('fOIpct').value) > 0 ? 1 : 0)
+    + (parseFloat(document.getElementById('fVol').value) > 0 ? 1 : 0)
+    + (document.getElementById('fIVmin').value || document.getElementById('fIVmax').value ? 1 : 0);
+  const badge = document.getElementById('filterBadge');
+  badge.textContent  = active > 0 ? `${active} ACTIVE` : 'OFF';
+  badge.style.background  = active > 0 ? 'rgba(255,208,0,.12)' : '';
+  badge.style.borderColor = active > 0 ? 'rgba(255,208,0,.3)'  : '';
+  badge.style.color       = active > 0 ? 'var(--yellow)' : '';
+}
+
+/* ══════════════════════════ AUTO REFRESH ══ */
+// ── Live candle ticker ───────────────────────────────
+let liveTickTimer = null;
+
+function updateLiveCandle() {
+  // Agar chart mein candles nahi hain ya intraday TF nahi hai — skip
+  if (!emaAllCandles.length) return;
+  if (!['1minute','5minute','15minute','30minute'].includes(currentTf)) return;
+
+  // Live spot — chain se ya LTP element se
+  let liveSpot = 0;
+  if (chainData?.length) {
+    liveSpot = chainData[0]?.underlying_spot_price || 0;
+  }
+  if (!liveSpot) {
+    const ltpEl = document.getElementById('spotPrice') || document.getElementById('statSpot');
+    liveSpot = parseFloat(ltpEl?.textContent?.replace(/,/g,'')) || 0;
+  }
+  if (!liveSpot) return;
+
+  const tfMs = {
+    '1minute':  60000,
+    '5minute':  300000,
+    '15minute': 900000,
+    '30minute': 1800000,
+  }[currentTf] || 60000;
+
+  const now     = Date.now();
+  const last    = emaAllCandles[emaAllCandles.length - 1];
+  const lastTs  = new Date(last[0]).getTime();
+  const diff    = now - lastTs;
+
+  if (diff < tfMs * 1.5) {
+    // ── Update existing last candle live ──────────────
+    emaAllCandles[emaAllCandles.length - 1] = [
+      last[0],
+      last[1],                          // open stays
+      Math.max(last[2], liveSpot),      // high = max
+      Math.min(last[3], liveSpot),      // low  = min
+      liveSpot,                         // close = live price
+      last[5] || 0,
+    ];
+  } else if (diff < tfMs * 4) {
+    // ── New candle started — add live bar ─────────────
+    const newTs = new Date(Math.floor(now / tfMs) * tfMs).toISOString();
+    // Check if already exists
+    const exists = emaAllCandles[emaAllCandles.length - 1][0] === newTs;
+    if (!exists) {
+      emaAllCandles.push([newTs, liveSpot, liveSpot, liveSpot, liveSpot, 0]);
+    } else {
+      // Update the new candle
+      const nc = emaAllCandles[emaAllCandles.length - 1];
+      emaAllCandles[emaAllCandles.length - 1] = [
+        nc[0], nc[1],
+        Math.max(nc[2], liveSpot),
+        Math.min(nc[3], liveSpot),
+        liveSpot, nc[5] || 0,
+      ];
+    }
+  }
+
+  // Re-render chart (only if not already rendering)
+  if (!window._chartRendering) {
+    window._chartRendering = true;
+    renderEmaChart();
+    window._chartRendering = false;
+  }
+}
+
+function startLiveTick() {
+  if (liveTickTimer) clearInterval(liveTickTimer);
+  // Update every 3 seconds for smooth live candle
+  liveTickTimer = setInterval(updateLiveCandle, 3000);
+}
+
+function stopLiveTick() {
+  if (liveTickTimer) { clearInterval(liveTickTimer); liveTickTimer = null; }
+}
+
+function toggleAuto() {
+  const btn = document.getElementById('autoBtn');
+  if (autoTimer) {
+    clearInterval(autoTimer); autoTimer = null;
+    stopLiveTick();
+    btn.textContent = 'AUTO: OFF'; btn.className = 'btn btn-ghost btn-sm';
+  } else {
+    fetchChain();
+    autoTimer = setInterval(fetchChain, 30000);
+    startLiveTick();
+    btn.textContent = 'AUTO: ON (30s)'; btn.className = 'btn btn-primary btn-sm';
+  }
+}
+
+/* ══════════════════════════ UTILS ══ */
+function fmt(n)  { return n == null ? '—' : Number(n).toLocaleString('en-IN'); }
+function fmtN(n) { return n == null || n === 0 ? '—' : Number(n).toLocaleString('en-IN'); }
+function fmtK(n) {
+  if (!n || n === 0) return '—';
+  if (n >= 1e7) return (n/1e7).toFixed(2)+'Cr';
+  if (n >= 1e5) return (n/1e5).toFixed(2)+'L';
+  if (n >= 1000) return (n/1000).toFixed(1)+'K';
+  return String(n);
+}
+function toast(msg, isErr = false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.display    = 'block';
+  el.style.background = isErr ? 'rgba(255,61,107,.1)' : 'rgba(0,229,160,.08)';
+  el.style.borderColor= isErr ? 'rgba(255,61,107,.3)' : 'rgba(0,229,160,.25)';
+  el.style.color      = isErr ? 'var(--red)' : 'var(--green)';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.display = 'none'; }, isErr ? 6000 : 3000);
+}
+</script>
+
+<div id="mobileNav" style="
+  display:none;
+  position:fixed; bottom:0; left:0; right:0; z-index:200;
+  background:rgba(7,11,18,.97);
+  border-top:1px solid var(--border2);
+  padding:8px 0 env(safe-area-inset-bottom,8px);
+  backdrop-filter:blur(20px);
+">
+  <div style="display:flex; justify-content:space-around; align-items:center;">
+    <button onclick="mobileScrollTo('chain')" style="background:none;border:none;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:2px;padding:4px 8px;cursor:pointer;font-family:var(--font-mono);font-size:10px;letter-spacing:.5px;">
+      <span style="font-size:18px;">📊</span>CHAIN
+    </button>
+    <button onclick="mobileScrollTo('ai')" style="background:none;border:none;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:2px;padding:4px 8px;cursor:pointer;font-family:var(--font-mono);font-size:10px;letter-spacing:.5px;">
+      <span style="font-size:18px;">🧠</span>AI
+    </button>
+    <button onclick="document.getElementById('refreshBtn').click()" style="background:var(--accent);border:none;color:#000;display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 20px;border-radius:20px;cursor:pointer;font-family:var(--font-mono);font-size:11px;font-weight:700;letter-spacing:1px;">
+      <span style="font-size:16px;">⟳</span>REFRESH
+    </button>
+    <button onclick="mobileScrollTo('unusual')" style="background:none;border:none;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:2px;padding:4px 8px;cursor:pointer;font-family:var(--font-mono);font-size:10px;letter-spacing:.5px;">
+      <span style="font-size:18px;">🔥</span>ALERTS
+    </button>
+    <button onclick="mobileScrollTo('wa')" style="background:none;border:none;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:2px;padding:4px 8px;cursor:pointer;font-family:var(--font-mono);font-size:10px;letter-spacing:.5px;">
+      <span style="font-size:18px;">💬</span>WA
+    </button>
+  </div>
+</div>
+
+<script>
+(function(){
+  function checkMobileNav() {
+    const nav = document.getElementById('mobileNav');
+    if (!nav) return;
+    if (window.innerWidth <= 768) {
+      nav.style.display = 'block';
+      document.querySelector('.app').style.paddingBottom = '72px';
+      // Show scroll hint
+      const hint = document.getElementById('scrollHint');
+      if (hint) hint.style.display = 'block';
+    } else {
+      nav.style.display = 'none';
+      document.querySelector('.app').style.paddingBottom = '0';
+      const hint = document.getElementById('scrollHint');
+      if (hint) hint.style.display = 'none';
+    }
+  }
+  window.addEventListener('resize', checkMobileNav);
+  window.addEventListener('DOMContentLoaded', checkMobileNav);
+  checkMobileNav();
+
+  // Hide scroll hint after first scroll
+  document.addEventListener('scroll', function() {
+    const hint = document.getElementById('scrollHint');
+    if (hint) hint.style.display = 'none';
+  }, { once: true, passive: true });
+
+  // Also handle touch scroll on table
+  document.addEventListener('DOMContentLoaded', function() {
+    const wrap = document.querySelector('.scroll-x');
+    if (wrap) {
+      wrap.addEventListener('touchstart', function() {
+        const hint = document.getElementById('scrollHint');
+        if (hint) hint.style.display = 'none';
+      }, { once: true, passive: true });
+    }
+  });
+
+  window.mobileScrollTo = function(key) {
+    const targets = {
+      chain:   () => document.querySelector('#tableContainer, .section-panel'),
+      ai:      () => document.querySelector('.ai-panel'),
+      unusual: () => document.querySelector('.unusual-panel, #unusualBody'),
+      wa:      () => document.querySelector('.wa-panel, #waBody')
+    };
+    // Find all section panels and match by header text
+    const panels = document.querySelectorAll('.section-panel');
+    const textMap = { chain:'OPTION CHAIN', ai:'AI MARKET', unusual:'UNUSUAL', wa:'WHATSAPP' };
+    let found = null;
+    panels.forEach(p => {
+      if (textMap[key] && p.textContent.toUpperCase().includes(textMap[key])) found = p;
+    });
+    if (!found && targets[key]) found = targets[key]();
+    if (found) found.scrollIntoView({behavior:'smooth', block:'start'});
+  };
+})();
+/* ══════════════════════════════════════════════════════
+   MASTER SIGNAL TESTER (Tracks ALL 4 Engines)
+══════════════════════════════════════════════════════ */
+let strategyLogs = [];
+
+function checkAndLogSignals(spot) {
+  if (!chainData.length || !spot) return;
+  const instrKey = document.getElementById('symbolSel')?.value || '';
+  const label    = INSTRUMENTS[instrKey]?.label || 'INDEX';
+  const time     = new Date().toLocaleTimeString('en-IN');
+  const step     = INSTRUMENTS[instrKey]?.step || 50;
+  const atm      = Math.round(spot / step) * step;
+  const pcr      = document.getElementById('statPCR')?.textContent || '—';
+  const ctx      = `PCR:${pcr}`;
+
+  // 1. AI / OI ANALYSIS ENGINE
+  try {
+    const r = analyzeOptionChain();
+    if (r && r.dirClass && r.dirClass !== 'neutral') {
+      registerSignalLog('AI+OI', r.dirClass === 'bullish' ? 'BULL' : 'BEAR',
+        spot, time, label, `${r.direction} (${r.confidence}%) ${ctx}`);
+    }
+  } catch(e) { console.log('MST AI err:', e); }
+
+  // 2. EMA CROSSOVER
+  if (emaAllCandles.length > 2) {
+    try {
+      const opens  = emaAllCandles.map(c => c[1]);
+      const closes = emaAllCandles.map(c => c[4]);
+      const emaO   = calcEMA(opens,  6);
+      const emaC   = calcEMA(closes, 6);
+      const n      = emaAllCandles.length - 1;
+      if (emaC[n] != null && emaO[n] != null && emaC[n-1] != null && emaO[n-1] != null) {
+        if (emaC[n-1] <= emaO[n-1] && emaC[n] > emaO[n])
+          registerSignalLog('EMA Cross', 'BULL', spot, time, label, `Bull Cross @ ${spot} ${ctx}`);
+        else if (emaC[n-1] >= emaO[n-1] && emaC[n] < emaO[n])
+          registerSignalLog('EMA Cross', 'BEAR', spot, time, label, `Bear Cross @ ${spot} ${ctx}`);
+      }
+    } catch(e) { console.log('MST EMA err:', e); }
+  }
+
+  // 3. OI BUILD AT ATM (Call/Put writing)
+  try {
+    const atmRow = chainData.find(d => d.strike_price === atm);
+    if (atmRow) {
+      const ce    = atmRow.call_options?.market_data || {};
+      const pe    = atmRow.put_options?.market_data  || {};
+      const ceChg = (ce.oi||0) - (ce.prev_oi||0);
+      const peChg = (pe.oi||0) - (pe.prev_oi||0);
+      if (peChg > 0)
+        registerSignalLog('OI Build', 'BULL', spot, time, label, `Put Build +${peChg.toLocaleString()} @ ATM ${atm}`);
+      if (ceChg > 0)
+        registerSignalLog('OI Build', 'BEAR', spot, time, label, `Call Build +${ceChg.toLocaleString()} @ ATM ${atm}`);
+    }
+  } catch(e) {}
+
+  // 4. SENTIMENT
+  try {
+    const trendEl = document.getElementById('sentTrendVal');
+    const trend   = trendEl?.textContent || '';
+    if (trend && trend !== '—') {
+      if (trend.toUpperCase().includes('BULL'))
+        registerSignalLog('Sentiment', 'BULL', spot, time, label, `${trend} ${ctx}`);
+      else if (trend.toUpperCase().includes('BEAR'))
+        registerSignalLog('Sentiment', 'BEAR', spot, time, label, `${trend} ${ctx}`);
+    }
+  } catch(e) {}
+
+  // 5. OI SPIKE ALERTS
+  try {
+    chainData.forEach(d => {
+      const ce   = d.call_options?.market_data || {};
+      const pe   = d.put_options?.market_data  || {};
+      const s    = d.strike_price;
+      if (Math.abs(s - spot) > step * 8) return; // only near ATM
+      const cChg = (ce.oi||0) - (ce.prev_oi||0);
+      const pChg = (pe.oi||0) - (pe.prev_oi||0);
+      if (cChg > 100000)
+        registerSignalLog('OI Spike', 'BEAR', spot, time, label, `CE Spike +${(cChg/1000).toFixed(0)}K @ ${s}`);
+      if (pChg > 100000)
+        registerSignalLog('OI Spike', 'BULL', spot, time, label, `PE Spike +${(pChg/1000).toFixed(0)}K @ ${s}`);
+    });
+  } catch(e) {}
+}
+
+function registerSignalLog(source, type, entrySpot, time, symbol, notes) {
+  // Cooldown per source — OI Build/Spike = 30min, others = 5min
+  const cooldownMs = (source === 'OI Build' || source === 'OI Spike') 
+    ? 30 * 60 * 1000   // 30 min — OI build changes slowly
+    : 5  * 60 * 1000;  // 5 min
+
+  const isDuplicate = strategyLogs.some(log =>
+    log.source === source && log.type === type && log.symbol === symbol &&
+    (new Date() - new Date(log.timestampObj)) < cooldownMs
+  );
+  if (isDuplicate) return;
+
+  strategyLogs.push({
+    id        : Date.now(),
+    timestampObj: new Date().toISOString(),
+    time,
+    source,
+    type,
+    symbol,
+    entrySpot,
+    currentSpot : entrySpot,
+    maxFavorable: 0,
+    maxAdverse  : 0,
+    notes
+  });
+
+  toast(`🧪 ${type} — ${source}: ${notes.slice(0,40)}`, false);
+  renderSignalLogs();
+}
+
+function updateSignalLogs(currentSpot) {
+  if (!strategyLogs.length || !currentSpot) return;
+  const now = new Date();
+  strategyLogs.forEach(log => {
+    // Only track for 2 hours after entry
+    const ageMs = now - new Date(log.timestampObj);
+    if (ageMs > 2 * 60 * 60 * 1000) return;
+
+    log.currentSpot = currentSpot;
+    const move = currentSpot - log.entrySpot;
+    const favorable = log.type === 'BULL' ? move : -move;
+    const adverse   = log.type === 'BULL' ? move : -move;
+
+    if (favorable > log.maxFavorable) log.maxFavorable = favorable;
+    if (adverse   < log.maxAdverse)   log.maxAdverse   = adverse;
+  });
+  renderSignalLogs();
+}
+
+function renderSignalLogs() {
+  const tbody = document.getElementById('logTableBody');
+  if (!tbody) return;
+
+  // Update waiting message
+  const waiting = document.getElementById('signalWaiting');
+
+  if (!strategyLogs.length) {
+    if (waiting) waiting.style.display = '';
+    tbody.innerHTML = '';
+    return;
+  }
+  if (waiting) waiting.style.display = 'none';
+
+  const sorted = [...strategyLogs].sort((a,b) => b.id - a.id).slice(0, 50);
+  tbody.innerHTML = sorted.map(log => {
+    const isBull    = log.type === 'BULL';
+    const typeColor = isBull ? '#00e5a0' : '#ff3d6b';
+    const typeLabel = isBull ? '▲ BULL' : '▼ BEAR';
+    const currMove  = isBull ? (log.currentSpot - log.entrySpot) : (log.entrySpot - log.currentSpot);
+    const currColor = currMove > 0 ? '#00e5a0' : currMove < 0 ? '#ff3d6b' : 'var(--muted)';
+    const favColor  = log.maxFavorable > 5  ? '#00e5a0' : 'var(--muted)';
+    const advColor  = log.maxAdverse   < -5 ? '#ff3d6b' : 'var(--muted)';
+    const pnlStr    = `${currMove >= 0 ? '+' : ''}${currMove.toFixed(1)}`;
+
+    return `<tr style="border-bottom:1px solid var(--border);font-family:var(--font-mono);font-size:10px;">
+      <td style="padding:5px 8px;color:var(--muted);white-space:nowrap;">${log.time}</td>
+      <td style="padding:5px 8px;color:#a78bfa;">${log.source}</td>
+      <td style="padding:5px 8px;color:${typeColor};font-weight:bold;">${typeLabel}</td>
+      <td style="padding:5px 8px;">${log.entrySpot.toFixed(1)}</td>
+      <td style="padding:5px 8px;color:${currColor};font-weight:bold;">${log.currentSpot.toFixed(1)} <span style="font-size:11px;">(${pnlStr})</span></td>
+      <td style="padding:5px 8px;color:${favColor};">+${log.maxFavorable.toFixed(1)}</td>
+      <td style="padding:5px 8px;color:${advColor};">${log.maxAdverse.toFixed(1)}</td>
+      <td style="padding:5px 8px;color:var(--muted);font-size:11px;max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${log.notes}">${log.notes}</td>
+    </tr>`;
+  }).join('');
+}
+
+function exportSignalLogs() {
+  if (!strategyLogs.length) return toast('Log empty hai.', true);
+  const logStr = JSON.stringify(strategyLogs, null, 2);
+  navigator.clipboard.writeText(logStr).then(() => {
+    toast('✓ Logs Copied!', false);
+  }).catch(err => { toast('Error copying logs', true); });
+}
+// [duplicate checkAndLogSignals removed]
+
+// [old updateSignalLogs removed]
+</script>
+
+</body>
+</html>
