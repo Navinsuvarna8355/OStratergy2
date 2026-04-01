@@ -7769,11 +7769,22 @@ async function ghGetFile(path) {
 }
 async function ghPutFile(path,str,msg,sha) {
   const {token,user,repo,branch}=ghConfig();
-  const body={message:msg,content:btoa(unescape(encodeURIComponent(str))),branch};
+  // Proper UTF-8 safe base64 encoding (chunk-based for large files)
+  const bytes = new TextEncoder().encode(str);
+  let b64 = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    b64 += String.fromCharCode(...bytes.slice(i, i + chunkSize));
+  }
+  b64 = btoa(b64);
+  const body={message:msg,content:b64,branch};
   if(sha) body.sha=sha;
   const r=await fetch(`https://api.github.com/repos/${user}/${repo}/contents/${path}`,
     {method:'PUT',headers:{Authorization:`token ${token}`,Accept:'application/vnd.github.v3+json','Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(!r.ok) throw new Error(`PUT ${r.status}`);
+  if(!r.ok) {
+    const errBody = await r.json().catch(() => ({}));
+    throw new Error(`GitHub ${r.status}: ${errBody.message || 'unknown error'}`);
+  }
   return r.json();
 }
 function buildOISnapshot() {
@@ -7873,20 +7884,22 @@ function openGithubSettings() {
 
 function ghManualSaveNow() {
   document.getElementById('ghSettingsOverlay')?.remove();
-  // Force save ignoring market hours check
   const cfg = ghConfig();
   if (!cfg.token || !cfg.user) {
-    toast('Token aur Username pehle set karo!', true); return;
+    toast('Token aur Username pehle set karo! ⚙ GITHUB OI button dabao.', true); return;
   }
-  updateGhStatus('⏳ Manual save...', '#ff9f40');
-  // Temporarily override market hours
+  updateGhStatus('⏳ Manual CSV save...', '#ff9f40');
+  // Override market hours for manual save
   const origFn = window.isMarketHours;
   window.isMarketHours = () => true;
-  Promise.all([saveOISnapshot(), saveCSVRow()]).then(() => {
+  saveCSVRow().then(() => {
     window.isMarketHours = origFn;
+    // Also save JSON snapshot
+    saveOISnapshot();
   }).catch(e => {
     window.isMarketHours = origFn;
-    updateGhStatus('✗ ' + e.message, '#ff3d6b');
+    updateGhStatus('✗ Manual save failed: ' + e.message, '#ff3d6b');
+    console.error('Manual save error:', e);
   });
 }
 
@@ -8071,8 +8084,12 @@ async function saveCSVRow() {
     let csvContent, sha;
     if (existing) {
       // Decode existing CSV and append new row
-      const decoded = decodeURIComponent(escape(atob(existing.content.replace(/\n/g,''))));
-      csvContent = decoded.trimEnd() + '\n' + row + '\n';
+      // Proper base64 decode - strip all whitespace from base64
+      const b64clean = existing.content.replace(/[\s]/g, '');
+      const decoded = new TextDecoder().decode(
+        Uint8Array.from(atob(b64clean), c => c.charCodeAt(0))
+      );
+      csvContent = decoded.trimEnd() + '\n' + row;
       sha = existing.sha;
     } else {
       // New file — add headers + first row
@@ -8084,6 +8101,7 @@ async function saveCSVRow() {
     updateGhStatus(`✓ CSV row saved ${time}`, '#00e5a0');
 
   } catch(e) {
+    console.error('CSV Save Error:', e);
     updateGhStatus(`✗ CSV: ${e.message}`, '#ff3d6b');
   }
   _csvSaving = false;
