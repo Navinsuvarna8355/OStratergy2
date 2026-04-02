@@ -4116,24 +4116,74 @@ function runMarketIntelligence() {
   if (ivSkew < -1) score += 1;
   else if (ivSkew > 2) score -= 1;
 
-  const verdict = score >= 3 ? { label:'STRONGLY BULLISH 📈', color:'var(--green)', bg:'rgba(0,229,160,.08)', border:'rgba(0,229,160,.3)',
-    action:`✅ CE buy karo — ${fmtN(atm+step)} CE ya ${fmtN(atm)} CE. Stop loss: 40% premium loss pe.` } :
-    score >= 1 ? { label:'MILDLY BULLISH 📈', color:'var(--green)', bg:'rgba(0,229,160,.05)', border:'rgba(0,229,160,.2)',
-    action:`⚡ Mild bullish — ${fmtN(atm)} CE consider karo. Confirmation ka wait karo.` } :
-    score <= -3 ? { label:'STRONGLY BEARISH 📉', color:'var(--red)', bg:'rgba(255,61,107,.08)', border:'rgba(255,61,107,.3)',
-    action:`✅ PE buy karo — ${fmtN(atm-step)} PE ya ${fmtN(atm)} PE. Stop loss: 40% premium loss pe.` } :
-    score <= -1 ? { label:'MILDLY BEARISH 📉', color:'var(--red)', bg:'rgba(255,61,107,.05)', border:'rgba(255,61,107,.2)',
-    action:`⚡ Mild bearish — ${fmtN(atm)} PE consider karo. Confirmation ka wait karo.` } :
-    { label:'NEUTRAL / SIDEWAYS ↔', color:'var(--yellow)', bg:'rgba(255,208,0,.06)', border:'rgba(255,208,0,.2)',
-    action:`⚖️ Range-bound — Short straddle ${fmtN(atm)} ya kuch mat karo. Wait for breakout.` };
+  // IV gate based on CSV analysis (3 days):
+  // IV >25% = seller day — NEVER buy options (2-Apr: +1418 pts, CE -274, PE -264!)
+  // IV 18-25% = risky zone
+  // IV <18% = buyer safe zone
+  const ivGate = atmCEiv > 25 ? 'seller' : atmCEiv > 18 ? 'risky' : 'safe';
+  const dteGate = dte === 0 ? 'expiry' : dte === 1 ? 'nearExpiry' : 'normal';
+
+  // PCR momentum check (2-Apr insight: PCR >1.2 = strong bull spot move)
+  if (!window._pcrHistory) window._pcrHistory = [];
+  const totalCallOI_v = chainData.reduce((s,d)=>s+(d.call_options?.market_data?.oi||0),0);
+  const totalPutOI_v  = chainData.reduce((s,d)=>s+(d.put_options?.market_data?.oi||0),0);
+  const livePCR = totalCallOI_v > 0 ? totalPutOI_v/totalCallOI_v : 1;
+  window._pcrHistory.push(livePCR);
+  if (window._pcrHistory.length > 10) window._pcrHistory.shift();
+  const pcrPrev5 = window._pcrHistory.length >= 5 ? window._pcrHistory[window._pcrHistory.length-5] : livePCR;
+  const pcrMomo  = livePCR - pcrPrev5; // positive = PCR rising = bullish
+
+  // Spot momentum (2-Apr: +445 pts in one refresh = strong signal)
+  const spotHistory = window._spotHistory || [];
+  const spotPrev10  = spotHistory.length >= 8 ? spotHistory[spotHistory.length-8] : spot;
+  const spotMomo    = spot - spotPrev10; // pts in last ~4 min
+
+  const verdict = (() => {
+    // Expiry day — no option buy, show spot direction only
+    if (dteGate === 'expiry') {
+      if (score >= 2) return { label:'BULLISH SPOT 🚀 (Expiry — Options mat kharido)', color:'var(--green)', bg:'rgba(0,229,160,.08)', border:'rgba(0,229,160,.3)',
+        action:`⚡ EXPIRY DAY: Spot upar ja sakta hai lekin CE/PE mat kharido — Theta -${Math.abs(atmCEtheta).toFixed(0)}/day. PCR=${livePCR.toFixed(2)} bullish hai.` };
+      if (score <= -2) return { label:'BEARISH SPOT 📉 (Expiry — Options mat kharido)', color:'var(--red)', bg:'rgba(255,61,107,.08)', border:'rgba(255,61,107,.3)',
+        action:`⚡ EXPIRY DAY: Spot neeche ja sakta hai lekin PE mat kharido — Theta kha jayega.` };
+      return { label:'EXPIRY — WAIT ⏳', color:'var(--yellow)', bg:'rgba(255,208,0,.06)', border:'rgba(255,208,0,.2)',
+        action:`⚡ Expiry pe options buying BAND. Spot direction unclear. Wait karo.` };
+    }
+    // Seller day (IV >25%) — no buying
+    if (ivGate === 'seller') {
+      if (score >= 2) return { label:'BULLISH — SELLER DAY ⚠️', color:'#ff9f40', bg:'rgba(255,159,64,.06)', border:'rgba(255,159,64,.3)',
+        action:`⚠️ Spot bullish hai lekin IV ${atmCEiv.toFixed(0)}%>25% — Buying mat karo. Sellers dominant hain. IV <18% hone ka wait karo.` };
+      if (score <= -2) return { label:'BEARISH — SELLER DAY ⚠️', color:'#ff9f40', bg:'rgba(255,159,64,.06)', border:'rgba(255,159,64,.3)',
+        action:`⚠️ Spot bearish hai lekin IV ${atmCEiv.toFixed(0)}%>25% — PE buying mat karo. Wait for IV <18%.` };
+      return { label:'SELLER DAY — WAIT 🔴', color:'var(--red)', bg:'rgba(255,61,107,.05)', border:'rgba(255,61,107,.2)',
+        action:`🔴 IV ${atmCEiv.toFixed(0)}% bahut zyada — Koi option buying nahi. Sellers kamate hain aaj.` };
+    }
+    // Risky zone (IV 18-25%)
+    if (ivGate === 'risky') {
+      if (score >= 3) return { label:'STRONGLY BULLISH ⚠️ (IV Risky)', color:'#ffd000', bg:'rgba(255,208,0,.06)', border:'rgba(255,208,0,.3)',
+        action:`⚠️ Bullish signal strong hai lekin IV ${atmCEiv.toFixed(0)}% risky zone mein hai. Chhoti position lo ya wait karo IV <18%.` };
+      if (score <= -3) return { label:'STRONGLY BEARISH ⚠️ (IV Risky)', color:'#ffd000', bg:'rgba(255,208,0,.06)', border:'rgba(255,208,0,.3)',
+        action:`⚠️ Bearish signal strong hai lekin IV ${atmCEiv.toFixed(0)}% risky — Chhoti position ya wait karo.` };
+    }
+    // Safe zone (IV <18%) — full signals
+    if (score >= 3) return { label:'STRONGLY BULLISH 📈', color:'var(--green)', bg:'rgba(0,229,160,.08)', border:'rgba(0,229,160,.3)',
+      action:`✅ CE buy karo — ${fmtN(atm+step)} CE ya ${fmtN(atm)} CE. IV ${atmCEiv.toFixed(0)}% safe zone. Stop loss: 40% premium loss pe.` };
+    if (score >= 1) return { label:'MILDLY BULLISH 📈', color:'var(--green)', bg:'rgba(0,229,160,.05)', border:'rgba(0,229,160,.2)',
+      action:`⚡ Mild bullish — ${fmtN(atm)} CE consider karo. IV ${atmCEiv.toFixed(0)}% ok. Confirmation ka wait karo.` };
+    if (score <= -3) return { label:'STRONGLY BEARISH 📉', color:'var(--red)', bg:'rgba(255,61,107,.08)', border:'rgba(255,61,107,.3)',
+      action:`✅ PE buy karo — ${fmtN(atm-step)} PE ya ${fmtN(atm)} PE. IV ${atmCEiv.toFixed(0)}% safe zone. Stop loss: 40% premium loss pe.` };
+    if (score <= -1) return { label:'MILDLY BEARISH 📉', color:'var(--red)', bg:'rgba(255,61,107,.05)', border:'rgba(255,61,107,.2)',
+      action:`⚡ Mild bearish — ${fmtN(atm)} PE consider karo. Confirmation ka wait karo.` };
+    return { label:'NEUTRAL / SIDEWAYS ↔', color:'var(--yellow)', bg:'rgba(255,208,0,.06)', border:'rgba(255,208,0,.2)',
+      action:`⚖️ Range-bound — Short straddle ${fmtN(atm)} ya wait for breakout.` };
+  })();
 
   const factorsHtml = [
-    `PCR ${pcr.toFixed(2)} → ${pcr>1.2?'✅ Bullish':pcr<0.8?'❌ Bearish':'➡ Neutral'}`,
+    `PCR ${livePCR.toFixed(2)} → ${livePCR>1.2?'✅ Bullish':livePCR<0.85?'❌ Bearish':'➡ Neutral'}${pcrMomo>0.1?' ↑RISING':pcrMomo<-0.1?' ↓FALLING':''}`,
     `OI Build → ${putOIbuild>callOIbuild?'✅ Put writers dominant (bull)':'❌ Call writers dominant (bear)'}`,
     `EMA 6 Bias → ${emaBias==='BULLISH'?'✅ Bullish':emaBias==='BEARISH'?'❌ Bearish':'➡ Neutral'}`,
     rsiVal ? `RSI ${rsiVal.toFixed(0)} → ${rsiVal>60?'✅ Bullish zone':rsiVal<40?'❌ Bearish zone':'➡ Neutral'}` : 'RSI → Chart load karo',
-    `IV Skew ${ivSkew.toFixed(1)}% → ${ivSkew>2?'❌ Downside fear':ivSkew<-1?'✅ Upside demand':'➡ Balanced'}`,
-    `IV Env → ${atmCEiv>25?'⚠ High IV (selling better)':atmCEiv<12?'✅ Low IV (buying ok)':'Normal IV'}`,
+    `IV Env → ${atmCEiv>25?'🔴 >25% SELLER DAY':atmCEiv>18?'⚠️ 18-25% Risky':'✅ <18% Buyer Safe'} (${atmCEiv.toFixed(0)}%)`,
+    spotMomo !== 0 ? `Spot Momo (4min) → ${spotMomo>200?'🚀 STRONG BULL +'+spotMomo.toFixed(0):spotMomo<-200?'📉 STRONG BEAR '+spotMomo.toFixed(0):spotMomo>0?'+'+spotMomo.toFixed(0):spotMomo.toFixed(0)} pts` : 'Spot Momo → Loading...',
   ].map(f => `<span style="display:inline-block;background:rgba(0,0,0,.2);border-radius:4px;padding:2px 8px;font-size:11px;margin:2px;font-family:var(--font-mono);">${f}</span>`).join('');
 
   document.getElementById('intelVerdict').innerHTML = `
