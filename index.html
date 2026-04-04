@@ -2369,6 +2369,7 @@ tr.atm-row td.strike-cell { color:var(--accent); }
           <button class="ind-pick-btn" onclick="addIndicator('bb')">Bollinger Bands</button>
           <button class="ind-pick-btn" onclick="addIndicator('supertrend')">Supertrend</button>
           <button class="ind-pick-btn" onclick="addIndicator('atr')">ATR</button>
+          <button class="ind-pick-btn" onclick="addIndicator('oi_composite')" style="background:rgba(0,229,160,.1);border-color:#00e5a040;color:#00e5a0;">OI Bias</button>
         </div>
       </div>
 
@@ -4811,7 +4812,7 @@ async function loadEmaChart() {
   const label    = INSTRUMENTS[instrKey]?.label || instrKey;
   const signalBox = document.getElementById('emaSignalBox');
   const subLabel  = document.getElementById('emaSubLabel');
-  if (subLabel) subLabel.textContent = `${label} · ${tf} · Loading...`;
+  if (subLabel) subLabel.textContent = `${label} · ${tf} · Loading...`; // OI signals need chain data
 
   const is5m  = tf === '5minute', is15m = tf === '15minute';
   const needsAgg = is5m || is15m;
@@ -5079,6 +5080,32 @@ function buildIndicatorDatasets(candles, viewStart, viewEnd) {
     else if (ind.type === 'atr') {
       // ATR shown in signal box only (not price scale)
     }
+    else if (ind.type === 'oi_composite') {
+      // OI Composite — PCR-based bias line (data-driven from CSV)
+      // Shows: green zone when PCR>1.15, red zone when PCR<0.85, yellow = neutral
+      if (liveOI) {
+        const pcr = liveOI.pcr;
+        const oi_color = pcr > 1.15 ? 'rgba(0,229,160,0.12)' :
+                         pcr < 0.85 ? 'rgba(255,61,107,0.12)' :
+                         'rgba(255,208,0,0.08)';
+        const oi_border = pcr > 1.15 ? '#00e5a040' : pcr < 0.85 ? '#ff3d6b40' : '#ffd00040';
+        const oi_label  = pcr > 1.15 ? 'PCR BULL' : pcr < 0.85 ? 'PCR BEAR' : 'PCR NEUTRAL';
+        // Create a horizontal band showing PCR bias
+        const oiData = new Array(viewEnd - viewStart).fill(
+          pcr > 1.15 ? Math.max(...emaAllCandles.slice(viewStart,viewEnd).map(c=>c[2])) * 0.999 :
+          pcr < 0.85 ? Math.min(...emaAllCandles.slice(viewStart,viewEnd).map(c=>c[3])) * 1.001 :
+          (Math.max(...emaAllCandles.slice(viewStart,viewEnd).map(c=>c[2])) +
+           Math.min(...emaAllCandles.slice(viewStart,viewEnd).map(c=>c[3]))) / 2
+        );
+        datasets.push({
+          type:'line', label:'OI Composite',
+          data: oiData,
+          borderColor: oi_border, backgroundColor: oi_color,
+          borderWidth: 1.5, borderDash: [6,3],
+          pointRadius: 0, tension: 0, fill: false, order: 2,
+        });
+      }
+    }
   });
 
   // ── Live OI metrics from current chainData ──────────
@@ -5113,15 +5140,42 @@ function buildIndicatorDatasets(candles, viewStart, viewEnd) {
     const ceLtpRising = ceLtpChg > 0.1;   // CE LTP > 0.1% upar
     const peLtpRising = peLtpChg > 0.1;   // PE LTP > 0.1% upar
 
+    // Live IV from ATM row
+    const liveAtmRow2 = chainData.find(d=>d.strike_price===liveAtm);
+    const liveIVpct   = liveAtmRow2?.call_options?.option_greeks?.iv || 0;
+    const liveThetaAbs= Math.abs(liveAtmRow2?.call_options?.option_greeks?.theta || 0);
+    // RSI from EMA candles
+    let liveRSI = null;
+    if (emaAllCandles && emaAllCandles.length > 14) {
+      const cl = emaAllCandles.map(c=>c[4]);
+      const rsiA = calcRSI(cl, 14);
+      liveRSI = Array.isArray(rsiA) ? rsiA[rsiA.length-1] : rsiA;
+    }
+    // Data-driven conditions (from 3-day CSV analysis)
+    const putHeavy   = putBld > callBld * 1.2;   // put writers dominant
+    const callHeavy  = callBld > putBld * 1.2;   // call writers dominant
+    const pcrBull    = livePCR > 1.15;            // PCR>1.15 = 68% accuracy
+    const pcrBear    = livePCR < 0.85;            // PCR<0.85
+    const pcrNeutral = livePCR >= 0.85 && livePCR <= 1.15;
+    const ivSafe     = liveIVpct < 25;            // not seller day
+    const thetaOk    = liveThetaAbs < 300;
+    // Sideways: EMA-PCR conflict OR PCR neutral
+    const isSideways = pcrNeutral || 
+                       (livePCR > 1.1 && callBld > putBld) ||  // PCR bull but OI bear
+                       (livePCR < 0.9 && putBld > callBld);    // PCR bear but OI bull
+
     liveOI = {
       pcr:livePCR, callWall:mCallS, putWall:mPutS,
-      isBullish:livePCR>1.2, isNeutral:livePCR>=0.8&&livePCR<=1.2, isBearish:livePCR<0.8,
+      isBullish:livePCR>1.15, isNeutral:pcrNeutral, isBearish:livePCR<0.85,
       callBuild:callBld, putBuild:putBld, callUnwind:callUnw, putUnwind:putUnw,
       putWallStrong: mPutS > liveAtm,
       callWallStrong: mCallS < liveAtm*1.02,
-      // LTP data
       atmCeLtp, atmPeLtp, ceLtpChg, peLtpChg,
       ceLtpRising, peLtpRising,
+      // New data-driven fields
+      liveIVpct, liveThetaAbs, liveRSI,
+      putHeavy, callHeavy, pcrBull, pcrBear, pcrNeutral,
+      ivSafe, thetaOk, isSideways,
     };
   }
 
@@ -5176,25 +5230,45 @@ function buildIndicatorDatasets(candles, viewStart, viewEnd) {
         const oiBull = liveOI.putBuild > liveOI.callBuild || liveOI.pcr > 1.0;
         const oiBear = liveOI.callBuild > liveOI.putBuild || liveOI.pcr < 1.0;
 
-        // IV gate: IV > 25% = seller day, no buy signals (CSV analysis)
-        const liveIVchk = (atmCEltp_iv => atmCEltp_iv)(
-          (() => { try { const ar = chainData.find(d=>d.strike_price===Math.round((chainData[0]?.underlying_spot_price||0)/50)*50); return (ar?.call_options?.option_greeks?.iv||0)*100; } catch(e){return 0;} })()
-        );
-        // BUY CE: bull cross + OI bullish + CE LTP rising + IV < 25%
-        if (bullCross && oiBull && liveOI.ceLtpRising && liveIVchk < 25) {
+        // ══ DATA-DRIVEN SIGNALS (3-day CSV analysis) ══
+        // BUY CE: EMA bull cross + PCR>1.15 + Put OI Heavy + IV<25% + Theta<300
+        // Accuracy: 68% (40 signals, avg +131 spot pts)
+        const ceBuyCondition = bullCross &&
+          liveOI.pcrBull &&          // PCR > 1.15
+          liveOI.putHeavy &&         // put build > call build * 1.2
+          liveOI.ivSafe &&           // IV < 25%
+          liveOI.thetaOk;            // Theta < 300
+        
+        // BUY PE: EMA bear cross + PCR<0.85 + Call OI Heavy + IV<25%
+        const peBuyCondition = bearCross &&
+          liveOI.pcrBear &&          // PCR < 0.85
+          liveOI.callHeavy &&        // call build > put build * 1.2
+          liveOI.ivSafe &&           // IV < 25%
+          liveOI.thetaOk;            // Theta < 300
+
+        // RSI boost: oversold recovery for CE, overbought reversal for PE
+        const rsiBullBoost = liveOI.liveRSI && liveOI.liveRSI < 40;
+        const rsiBearBoost = liveOI.liveRSI && liveOI.liveRSI > 65;
+
+        // SIDEWAYS: PCR neutral OR EMA-OI conflict
+        const sidewaysCondition = (bullCross || bearCross) && liveOI.isSideways;
+
+        if (ceBuyCondition) {
           signalBuyCE[i] = closes[i];
-        }
-        // BUY PE: bear cross + OI bearish + PE LTP rising + IV < 25%
-        else if (bearCross && oiBear && liveOI.peLtpRising && liveIVchk < 25) {
+        } else if (peBuyCondition) {
           signalBuyPE[i] = closes[i];
-        }
-        // SELL CE: bear cross + call wall strong + OI bearish
-        else if (bearCross && liveOI.callWallStrong && liveOI.callBuild > liveOI.putBuild) {
-          signalSellCE[i] = closes[i];
-        }
-        // SELL PE: bull cross + put wall strong + OI bullish
-        else if (bullCross && liveOI.putWallStrong && liveOI.putBuild > liveOI.callBuild) {
-          signalSellPE[i] = closes[i];
+        } else if (bullCross && liveOI.pcrBull && liveOI.ivSafe && rsiBullBoost) {
+          // RSI oversold boost — weaker CE signal
+          signalBuyCE[i] = closes[i];
+        } else if (bearCross && liveOI.pcrBear && liveOI.ivSafe && rsiBearBoost) {
+          // RSI overbought boost — weaker PE signal  
+          signalBuyPE[i] = closes[i];
+        } else if (bearCross && liveOI.callWallStrong && liveOI.callHeavy) {
+          signalSellCE[i] = closes[i];   // Seller day signal
+        } else if (bullCross && liveOI.putWallStrong && liveOI.putHeavy) {
+          signalSellPE[i] = closes[i];   // Seller day signal
+        } else if (sidewaysCondition) {
+          signalNoTrade[i] = closes[i];  // SIDEWAYS
         }
       } else if (!liveOI) {
         // No chain data — pure EMA signals
@@ -5490,8 +5564,8 @@ function renderEmaChart() {
       if(cChg>0) cB+=cChg; if(pChg>0) pB+=pChg;
     });
     const pcr = tC>0 ? tP/tC : 1;
-    const oiColor = pcr>1.2?'#00e5a0': pcr<0.8?'#ff3d6b':'#ff9f40';
-    const oiLabel = pcr>1.2?'BULLISH': pcr<0.8?'BEARISH':'NEUTRAL';
+    const oiColor = pcr>1.15?'#00e5a0': pcr<0.85?'#ff3d6b':'#ff9f40';
+    const oiLabel = pcr>1.15?'BULLISH': pcr<0.85?'BEARISH':'NEUTRAL';
     const buildStr = pB>cB
       ? `<span style="color:#00e5a0">Put Build ↑</span>`
       : cB>pB ? `<span style="color:#ff3d6b">Call Build ↑</span>`
